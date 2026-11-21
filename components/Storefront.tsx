@@ -1,17 +1,16 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ShoppingBag,
   ArrowRight,
-  ArrowUpRight,
   Plus,
   Minus,
   Trash2,
   CheckCircle2,
   X,
   MapPin,
-  Search,
+  MessageCircle,
   Banknote,
   Smartphone,
   Truck,
@@ -27,6 +26,8 @@ import {
   GRIND_OPTIONS,
   SERVICE_AREA,
   DELIVERY_STRIKE_PRICE,
+  PAYMENT_METHODS,
+  WHATSAPP_NUMBER,
   type ProductId,
   type PackSize,
   type Grind,
@@ -35,22 +36,41 @@ import { FlourBag } from "./FlourBag";
 import { GrainTexture } from "./GrainTexture";
 
 type Line = { id: ProductId; kg: PackSize; qty: number; grind: Grind; note: string };
-type Address = { name: string; phone: string; flat: string; society: string; street: string; area: string; pincode: string };
+type Address = { name: string; phone: string; flat: string; society: string; street: string; area: string; pincode: string; maps: string };
 type Step = "closed" | "cart" | "details" | "done";
-type SavedOrder = { id: string; phone: string; total: number; createdAt: string };
-type TrackedOrder = {
-  id: string;
-  createdAt: string;
-  updatedAt: string;
-  items: { productName: string; kg: number; quantity: number; grinding: string }[];
-  total: number;
-  paymentMethod: string;
-  status: string;
-};
 
-const emptyAddress: Address = { name: "", phone: "", flat: "", society: "", street: "", area: SERVICE_AREA.area, pincode: SERVICE_AREA.pincode };
+const emptyAddress: Address = { name: "", phone: "", flat: "", society: "", street: "", area: "", pincode: SERVICE_AREA.pincode, maps: "" };
+
+/** Keeps only digits and trims a pasted +91 / leading 0 so the field always holds the 10-digit number. */
+function cleanPhone(raw: string) {
+  let d = raw.replace(/\D/g, "");
+  if (d.length > 10 && d.startsWith("91")) d = d.slice(2);
+  if (d.length > 10 && d.startsWith("0")) d = d.slice(1);
+  return d.slice(0, 10);
+}
+
+const InstagramIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="3" y="3" width="18" height="18" rx="5" />
+    <circle cx="12" cy="12" r="4" />
+    <circle cx="17.5" cy="6.5" r=".6" fill="currentColor" />
+  </svg>
+);
 const CART_KEY = "flazzo_cart_v1";
-const ORDERS_KEY = "flazzo_guest_orders";
+const ADDRESS_KEY = "flazzo_address_v1";
+const PENDING_KEY = "flazzo_pending_order_v1";
+const PENDING_TTL = 24 * 60 * 60 * 1000; // ask "did you send it?" again for up to a day
+
+type Pending = { ref: string; total: number; url: string; at: number };
+
+const readCart = (raw: string | null): Line[] => {
+  try {
+    const saved = JSON.parse(raw || "[]");
+    return Array.isArray(saved) ? saved.filter((l) => products.some((p) => p.id === l.id) && (l.kg === 2 || l.kg === 5) && l.qty >= 1) : [];
+  } catch {
+    return [];
+  }
+};
 
 const fieldLabels: Record<keyof Address, string> = {
   name: "Full name",
@@ -60,15 +80,63 @@ const fieldLabels: Record<keyof Address, string> = {
   street: "Road / Full address",
   area: "Area / Locality",
   pincode: "Pincode",
+  maps: "Google Maps location link (optional)",
 };
 
 const grindCopy: Record<Grind, string> = {
-  Fine: "Silky flour for soft phulkas and thin chapatis.",
-  Medium: "The everyday balance. Our default for most homes.",
-  Coarse: "More texture and bite, great for bhakri and thick parathas.",
+  Fine: "Silky-smooth flour for soft phulkas and paper-thin chapatis.",
+  Medium: "The everyday balance: soft rotis with a light, wholesome bite.",
+  Coarse: "A hearty, textured grind with more bite. Made for thick, layered parathas.",
 };
 
-const TRACK_STEPS = ["New", "Confirmed", "Grinding", "Out for Delivery", "Delivered"];
+/** Same checks the old server API ran, now done in the browser. */
+function validate(a: Address) {
+  const e: Partial<Record<keyof Address, string>> = {};
+  if (a.name.trim().length < 2) e.name = "Please enter your full name.";
+  if (a.phone.length !== 10) e.phone = `Mobile number must be 10 digits (${a.phone.length}/10).`;
+  else if (!/^[6-9]/.test(a.phone)) e.phone = "Enter a valid Indian mobile number.";
+  if (!a.flat.trim()) e.flat = "Flat or house number is required.";
+  if (!a.society.trim()) e.society = "Society or building is required.";
+  if (!a.street.trim()) e.street = "Road or full address is required.";
+  if (!(SERVICE_AREA.areas as readonly string[]).includes(a.area)) e.area = "Choose Baner or Mahalunge.";
+  if (a.pincode !== SERVICE_AREA.pincode) e.pincode = `We deliver only in ${SERVICE_AREA.pincode}.`;
+  const maps = a.maps.trim();
+  if (maps && !/^https?:\/\/(maps\.app\.goo\.gl|goo\.gl\/maps|(www\.)?google\.[a-z.]+\/maps|maps\.google\.[a-z.]+)/i.test(maps))
+    e.maps = "Paste a Google Maps link, or leave this empty.";
+  return e;
+}
+
+/** Short, human-friendly order reference, e.g. FLZ-7K3Q9A. */
+const makeRef = () => "FLZ-" + Math.random().toString(36).slice(2, 8).toUpperCase();
+
+function buildWhatsAppText(ref: string, cart: Line[], a: Address, payment: "cash" | "upi", subtotal: number) {
+  const items = cart.map((l, i) => {
+    const p = products.find((x) => x.id === l.id)!;
+    const price = priceFor(l.id, l.kg);
+    const lines = [`${i + 1}. ${p.name} · ${l.kg} KG × ${l.qty} = ${money(price * l.qty)}`, `   Grind: ${l.grind}`];
+    if (l.note.trim()) lines.push(`   Note: ${l.note.trim()}`);
+    return lines.join("\n");
+  });
+  return [
+    `*New FLAZZO order* (${ref})`,
+    "",
+    "*Items*",
+    ...items,
+    "",
+    `Subtotal: ${money(subtotal)}`,
+    "Delivery: FREE",
+    `*Total: ${money(subtotal)}*`,
+    `Payment: ${PAYMENT_METHODS[payment]}`,
+    "",
+    "*Deliver to*",
+    a.name.trim(),
+    `Phone: +91 ${a.phone}`,
+    `${a.flat.trim()}, ${a.society.trim()}`,
+    a.street.trim(),
+    `${a.area.trim()} – ${a.pincode.trim()}`,
+    ...(a.maps.trim() ? [`Location: ${a.maps.trim()}`] : []),
+  ].join("\n");
+}
 
 export default function Storefront() {
   const [cart, setCart] = useState<Line[]>([]);
@@ -76,26 +144,48 @@ export default function Storefront() {
   const [step, setStep] = useState<Step>("closed");
   const [address, setAddress] = useState<Address>(emptyAddress);
   const [payment, setPayment] = useState<"cash" | "upi">("upi");
-  const [order, setOrder] = useState<{ id: string; total: number } | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [order, setOrder] = useState<(Pending & { sent: boolean }) | null>(null);
   const [formError, setFormError] = useState("");
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<keyof Address, string>>>({});
-  const [toast, setToast] = useState<string | null>(null);
+  const [announce, setAnnounce] = useState("");
   const [bump, setBump] = useState(0);
   const [packChoice, setPackChoice] = useState<Record<ProductId, PackSize>>({ maharashtra: 5, lokwan: 5, sharbati: 5 });
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Restore cart; forward Identity invite/recovery links to the admin page.
+  // Restore this device's cart, delivery details and any order still waiting to be sent on WhatsApp.
   useEffect(() => {
-    if (/(invite|recovery|confirmation|email_change)_token=/.test(window.location.hash)) {
-      window.location.replace("/admin" + window.location.hash);
-      return;
-    }
+    const savedCart = readCart(localStorage.getItem(CART_KEY));
+    setCart(savedCart);
     try {
-      const saved = JSON.parse(localStorage.getItem(CART_KEY) || "[]");
-      if (Array.isArray(saved)) setCart(saved.filter((l) => products.some((p) => p.id === l.id) && (l.kg === 2 || l.kg === 5)));
+      const a = JSON.parse(localStorage.getItem(ADDRESS_KEY) || "null");
+      if (a && typeof a === "object") {
+        const str = (v: unknown) => (typeof v === "string" ? v : "");
+        setAddress({
+          ...emptyAddress,
+          name: str(a.name),
+          phone: cleanPhone(str(a.phone)),
+          flat: str(a.flat),
+          society: str(a.society),
+          street: str(a.street),
+          area: (SERVICE_AREA.areas as readonly string[]).includes(a.area) ? a.area : "",
+          maps: str(a.maps),
+        });
+      }
     } catch {}
+    try {
+      const pending: Pending | null = JSON.parse(localStorage.getItem(PENDING_KEY) || "null");
+      if (pending && savedCart.length && Date.now() - pending.at < PENDING_TTL) {
+        setOrder({ ...pending, sent: false });
+        setStep("done");
+      } else localStorage.removeItem(PENDING_KEY);
+    } catch {
+      localStorage.removeItem(PENDING_KEY);
+    }
     setHydrated(true);
+
+    // Keep the cart in sync when the site is open in more than one tab.
+    const onStorage = (e: StorageEvent) => e.key === CART_KEY && setCart(readCart(e.newValue));
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   useEffect(() => {
@@ -103,11 +193,24 @@ export default function Storefront() {
   }, [cart, hydrated]);
 
   useEffect(() => {
+    if (hydrated) localStorage.setItem(ADDRESS_KEY, JSON.stringify(address));
+  }, [address, hydrated]);
+
+  /** Closing the drawer before confirming means "not sent yet": the cart stays, the pending order is dropped. */
+  function closeDrawer() {
+    if (step === "done") {
+      localStorage.removeItem(PENDING_KEY);
+      setOrder(null);
+    }
+    setStep("closed");
+  }
+
+  useEffect(() => {
     document.body.style.overflow = step === "closed" ? "" : "hidden";
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setStep("closed");
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && closeDrawer();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [step]);
+  });
 
   const count = cart.reduce((s, x) => s + x.qty, 0);
   const subtotal = useMemo(() => cart.reduce((s, l) => s + priceFor(l.id, l.kg) * l.qty, 0), [cart]);
@@ -118,43 +221,48 @@ export default function Storefront() {
       return found ? old.map((x) => (x === found ? { ...x, qty: Math.min(30, x.qty + 1) } : x)) : [...old, { id, kg, qty: 1, grind: "Medium", note: "" }];
     });
     const p = products.find((x) => x.id === id)!;
-    setToast(`${p.short} · ${kg} KG added`);
+    setAnnounce(`${p.short} ${kg} KG added to cart`);
     setBump((b) => b + 1);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 2400);
   }
   const update = (i: number, patch: Partial<Line>) => setCart((old) => old.map((x, n) => (n === i ? { ...x, ...patch } : x)));
   const remove = (i: number) => setCart((old) => old.filter((_, n) => n !== i));
   const scrollTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
 
-  async function placeOrder(e: React.FormEvent) {
+  function placeOrder(e: React.FormEvent) {
     e.preventDefault();
-    setBusy(true);
     setFormError("");
-    setFieldErrors({});
-    try {
-      const res = await fetch("/api/orders", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: cart, payment_method: payment, address }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        if (data.fieldErrors) setFieldErrors(data.fieldErrors);
-        throw new Error(data.error || "Could not place your order.");
-      }
-      setOrder({ id: data.order.id, total: data.order.total });
-      const old: SavedOrder[] = JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]");
-      const phone = address.phone.replace(/\D/g, "").slice(-10);
-      localStorage.setItem(ORDERS_KEY, JSON.stringify([{ id: data.order.id, phone, total: data.order.total, createdAt: data.order.createdAt }, ...old].slice(0, 10)));
-      window.dispatchEvent(new Event("flazzo:orders"));
-      setCart([]);
-      setStep("done");
-    } catch (err: any) {
-      setFormError(err.message);
-    } finally {
-      setBusy(false);
+    const errors = validate(address);
+    setFieldErrors(errors);
+    if (Object.keys(errors).length) {
+      setFormError("Please check your delivery details.");
+      return;
     }
+    if (cart.length === 0) {
+      setFormError("Your cart is empty.");
+      return;
+    }
+    const ref = makeRef();
+    const url = `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(buildWhatsAppText(ref, cart, address, payment, subtotal))}`;
+    // Opened synchronously inside the submit handler so pop-up blockers allow it.
+    const win = window.open(url, "_blank", "noopener");
+    if (!win) window.location.href = url;
+    // Keep the cart until the customer confirms they actually sent the message.
+    const pending: Pending = { ref, total: subtotal, url, at: Date.now() };
+    localStorage.setItem(PENDING_KEY, JSON.stringify(pending));
+    setOrder({ ...pending, sent: false });
+    setStep("done");
+  }
+
+  function confirmSent() {
+    localStorage.removeItem(PENDING_KEY);
+    setCart([]);
+    setOrder((o) => (o ? { ...o, sent: true } : o));
+  }
+
+  function editOrder() {
+    localStorage.removeItem(PENDING_KEY);
+    setOrder(null);
+    setStep("details");
   }
 
   return (
@@ -169,7 +277,6 @@ export default function Storefront() {
           <button onClick={() => scrollTo("shop")}>Wheat</button>
           <button onClick={() => scrollTo("grind")}>Grind</button>
           <button onClick={() => scrollTo("how")}>How it works</button>
-          <button onClick={() => scrollTo("track")}>Track order</button>
         </nav>
         <button className="cartBtn" onClick={() => setStep("cart")} aria-label={`Open cart, ${count} items`}>
           <ShoppingBag size={18} /> <span className="cartLabel">Cart</span>
@@ -182,7 +289,7 @@ export default function Storefront() {
         <section className="hero">
           <div className="heroText">
             <p className="eyebrow reveal" style={{ animationDelay: "0ms" }}>
-              <MapPin size={13} /> Now delivering in {SERVICE_AREA.area} · {SERVICE_AREA.pincode}
+              <MapPin size={13} /> Now delivering in {SERVICE_AREA.label} · {SERVICE_AREA.pincode}
             </p>
             <h1 className="reveal" style={{ animationDelay: "90ms" }}>
               Your wheat.
@@ -212,8 +319,8 @@ export default function Storefront() {
                 <textPath href="#circ">GROUND FRESH BY ORDER · GROUND FRESH BY ORDER · </textPath>
               </text>
             </svg>
-            <FlourBag variant={2} label="Sharbati" kg={5} className="heroBag back" />
-            <FlourBag variant={0} label="Lokwan" kg={2} className="heroBag front" />
+            <FlourBag name={products[2].pack} kg={5} className="heroBag back" />
+            <FlourBag name={products[1].pack} kg={2} className="heroBag front" />
           </div>
         </section>
 
@@ -251,7 +358,7 @@ export default function Storefront() {
                 <article className={`shelfRow r${i}`} key={p.id}>
                   <div className="shelfArt">
                     <span className="shelfNum">0{i + 1}</span>
-                    <FlourBag variant={i} label={p.short} kg={kg} className="shelfBag" />
+                    <FlourBag name={p.pack} kg={kg} className="shelfBag" />
                   </div>
                   <div className="shelfInfo">
                     <span className="tag">{p.tag}</span>
@@ -285,6 +392,10 @@ export default function Storefront() {
               );
             })}
           </div>
+
+          <p className="comingSoon">
+            <span>Coming soon</span> Multigrain, Jowar &amp; Bajri atta, milled fresh the same way.
+          </p>
         </section>
 
         {/* GRIND */}
@@ -297,7 +408,7 @@ export default function Storefront() {
                 <br />
                 <em>Set it for every pack.</em>
               </h2>
-              <p>Tell us how you like your atta when you check out. Add a note too, like a little extra coarseness for bhakri. We grind each pack the way you asked.</p>
+              <p>Tell us how you like your atta at checkout, and add a note if you have a preference. We grind every pack exactly the way you asked.</p>
             </div>
             <div className="grindCards">
               {GRIND_OPTIONS.map((g, i) => (
@@ -352,8 +463,6 @@ export default function Storefront() {
             <b>FREE</b>
           </div>
         </section>
-
-        <TrackOrder />
       </main>
 
       <footer>
@@ -363,11 +472,14 @@ export default function Storefront() {
             <small>FRESH ATTA YOUR WAY</small>
           </div>
           <p>Freshly ground wheat flour, delivered.</p>
+          <a className="social" href="https://www.instagram.com/flazzo.in/" target="_blank" rel="noopener noreferrer" aria-label="FLAZZO on Instagram">
+            <InstagramIcon /> @flazzo.in
+          </a>
         </div>
         <div className="footCol">
           <b>Service area</b>
           <span>
-            Currently operational in {SERVICE_AREA.area} – {SERVICE_AREA.pincode}
+            Currently delivering in {SERVICE_AREA.label} – {SERVICE_AREA.pincode}
           </span>
         </div>
         <div className="footCol">
@@ -377,23 +489,38 @@ export default function Storefront() {
         <div className="footCol">
           <b>Need help?</b>
           <span>
-            <a href="#track">Track an order</a>
+            <a href={`https://wa.me/${WHATSAPP_NUMBER}`} target="_blank" rel="noopener noreferrer">
+              Chat on WhatsApp
+            </a>
           </span>
         </div>
       </footer>
 
-      {/* TOAST */}
-      <div className={`toast ${toast ? "show" : ""}`} role="status" aria-live="polite">
-        {toast && (
-          <>
-            <CheckCircle2 size={18} /> {toast}
-            <button onClick={() => setStep("cart")}>View cart</button>
-          </>
-        )}
-      </div>
+      {/* FLOATING MINI CART — stays visible while the cart has items */}
+      <p className="srOnly" role="status" aria-live="polite">
+        {announce}
+      </p>
+      <button
+        className={`miniCart ${count > 0 && step === "closed" ? "show" : ""}`}
+        onClick={() => setStep("cart")}
+        aria-label={`View cart: ${count} ${count === 1 ? "pack" : "packs"}, ${money(subtotal)}`}
+        tabIndex={count > 0 && step === "closed" ? 0 : -1}
+      >
+        <span key={bump} className={`miniIcon ${bump ? "bump" : ""}`}>
+          <ShoppingBag size={17} />
+          <b>{count}</b>
+        </span>
+        <span className="miniText">
+          <small>
+            {count} {count === 1 ? "pack" : "packs"}
+          </small>
+          <b>{money(subtotal)}</b>
+        </span>
+        <ArrowRight size={16} />
+      </button>
 
       {/* DRAWER */}
-      <div className={`overlay ${step !== "closed" ? "open" : ""}`} onClick={() => setStep("closed")} aria-hidden={step === "closed"}>
+      <div className={`overlay ${step !== "closed" ? "open" : ""}`} onClick={closeDrawer} aria-hidden={step === "closed"}>
         <aside className="drawer" role="dialog" aria-modal="true" aria-label="Your cart" onClick={(e) => e.stopPropagation()}>
           <div className="drawerTop">
             {step !== "done" ? (
@@ -407,7 +534,7 @@ export default function Storefront() {
             ) : (
               <span />
             )}
-            <button className="close" onClick={() => setStep("closed")} aria-label="Close">
+            <button className="close" onClick={closeDrawer} aria-label="Close">
               <X size={18} />
             </button>
           </div>
@@ -417,7 +544,7 @@ export default function Storefront() {
               <h2>Your cart</h2>
               {cart.length === 0 ? (
                 <div className="empty">
-                  <FlourBag variant={0} label="Empty" className="emptyBag" />
+                  <FlourBag name={products[0].pack} className="emptyBag" />
                   <p>Your cart is empty. Add a wheat pack to continue.</p>
                   <button
                     className="ghostBtn"
@@ -436,7 +563,7 @@ export default function Storefront() {
                       const p = products.find((x) => x.id === l.id)!;
                       return (
                         <li className="cartLine" key={`${l.id}-${l.kg}`}>
-                          <FlourBag variant={products.indexOf(p)} label={p.short} kg={l.kg} className="lineBag" />
+                          <FlourBag name={p.pack} kg={l.kg} className="lineBag" />
                           <div className="lineInfo">
                             <b>{p.name}</b>
                             <small>
@@ -473,28 +600,59 @@ export default function Storefront() {
             <form onSubmit={placeOrder} noValidate>
               <h2>Where should we deliver?</h2>
               <p className="muted areaNote">
-                <MapPin size={14} /> We currently deliver in {SERVICE_AREA.area} ({SERVICE_AREA.pincode}).
+                <MapPin size={14} /> We currently deliver in {SERVICE_AREA.label} ({SERVICE_AREA.pincode}).
               </p>
               <div className="formGrid">
-                {(Object.keys(fieldLabels) as (keyof Address)[]).map((k) => (
-                  <label key={k} className={k === "street" ? "wide" : ""}>
-                    {fieldLabels[k]}
-                    <input
-                      required
-                      value={address[k]}
-                      inputMode={k === "phone" || k === "pincode" ? "numeric" : undefined}
-                      autoComplete={({ name: "name", phone: "tel-national", pincode: "postal-code", street: "street-address" } as Record<string, string>)[k]}
-                      maxLength={k === "phone" ? 14 : k === "pincode" ? 6 : 200}
-                      placeholder={k === "phone" ? "10-digit mobile number" : ""}
-                      aria-invalid={!!fieldErrors[k]}
-                      onChange={(e) => {
-                        setAddress({ ...address, [k]: e.target.value });
-                        if (fieldErrors[k]) setFieldErrors({ ...fieldErrors, [k]: undefined });
-                      }}
-                    />
-                    {fieldErrors[k] && <span className="fieldError">{fieldErrors[k]}</span>}
-                  </label>
-                ))}
+                {(Object.keys(fieldLabels) as (keyof Address)[]).map((k) => {
+                  const set = (v: string) => {
+                    setAddress({ ...address, [k]: v });
+                    if (fieldErrors[k]) setFieldErrors({ ...fieldErrors, [k]: undefined });
+                  };
+                  const error = fieldErrors[k] && <span className="fieldError">{fieldErrors[k]}</span>;
+
+                  if (k === "area") {
+                    return (
+                      <div key={k} className="fieldLabel">
+                        <span id="areaLabel">{fieldLabels.area}</span>
+                        <div className="seg areaSeg" role="radiogroup" aria-labelledby="areaLabel" aria-invalid={!!fieldErrors.area}>
+                          {SERVICE_AREA.areas.map((a) => (
+                            <button type="button" key={a} role="radio" aria-checked={address.area === a} className={address.area === a ? "on" : ""} onClick={() => set(a)}>
+                              {a}
+                            </button>
+                          ))}
+                        </div>
+                        {error}
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <label key={k} className={k === "street" || k === "maps" ? "wide" : ""}>
+                      {fieldLabels[k]}
+                      <span className={k === "phone" ? "phoneField" : undefined}>
+                        {k === "phone" && <em aria-hidden="true">+91</em>}
+                        <input
+                          required={k !== "maps"}
+                          value={address[k]}
+                          type={k === "phone" ? "tel" : "text"}
+                          readOnly={k === "pincode"}
+                          inputMode={k === "phone" || k === "pincode" ? "numeric" : k === "maps" ? "url" : undefined}
+                          autoComplete={({ name: "name", phone: "tel-national", pincode: "postal-code", street: "street-address" } as Record<string, string>)[k]}
+                          maxLength={k === "phone" ? 16 : k === "pincode" ? 6 : k === "maps" ? 500 : 200}
+                          placeholder={k === "phone" ? "10-digit number" : k === "maps" ? "Paste the link from Google Maps → Share" : ""}
+                          aria-invalid={!!fieldErrors[k]}
+                          onChange={(e) => set(k === "phone" ? cleanPhone(e.target.value) : e.target.value)}
+                          onBlur={
+                            k === "phone"
+                              ? () => address.phone && address.phone.length !== 10 && setFieldErrors((f) => ({ ...f, phone: `Mobile number must be 10 digits (${address.phone.length}/10).` }))
+                              : undefined
+                          }
+                        />
+                      </span>
+                      {error}
+                    </label>
+                  );
+                })}
               </div>
 
               <h3 className="formH">Grinding for each pack</h3>
@@ -535,41 +693,54 @@ export default function Storefront() {
                   {formError}
                 </p>
               )}
-              <button className="primary full" disabled={busy || cart.length === 0}>
-                {busy ? <span className="spinner" /> : null}
-                {busy ? "Placing order…" : `Place order · ${money(subtotal)}`}
+              <button className="primary full" disabled={cart.length === 0}>
+                Place order · {money(subtotal)}
               </button>
               <p className="fine">
-                <ShieldCheck size={13} /> No online payment needed. You pay when your atta arrives.
+                <ShieldCheck size={13} /> Opens WhatsApp with your order filled in. No online payment needed.
               </p>
             </form>
           )}
 
-          {step === "done" && order && (
+          {step === "done" && order && !order.sent && (
+            <div className="success">
+              <div className="successMark pending">
+                <MessageCircle size={40} />
+              </div>
+              <p className="eyebrow">One last step</p>
+              <h2>Did you send it?</h2>
+              <p>WhatsApp opened with your order filled in. Tap Send there, then confirm here. Your cart stays saved until you do.</p>
+              <div className="orderId">
+                <span>Order reference</span>
+                <b>{order.ref}</b>
+                <small>{money(order.total)} · pay at delivery</small>
+              </div>
+              <button className="primary full" onClick={confirmSent}>
+                <CheckCircle2 size={17} /> Yes, I've sent it
+              </button>
+              <a className="ghostBtn full" href={order.url} target="_blank" rel="noopener noreferrer">
+                Not yet, open WhatsApp again
+              </a>
+              <button className="textBtn" onClick={editOrder}>
+                Edit order details
+              </button>
+            </div>
+          )}
+
+          {step === "done" && order?.sent && (
             <div className="success">
               <div className="successMark">
                 <CheckCircle2 size={44} />
               </div>
-              <p className="eyebrow">Order received</p>
+              <p className="eyebrow">Order sent</p>
               <h2>Thank you!</h2>
-              <p>Your FLAZZO order is in. We'll grind it fresh and deliver it soon.</p>
+              <p>We'll confirm your order on WhatsApp shortly, then grind your atta fresh and bring it to your door.</p>
               <div className="orderId">
-                <span>Order ID</span>
-                <b>{order.id}</b>
+                <span>Order reference</span>
+                <b>{order.ref}</b>
                 <small>{money(order.total)} · pay at delivery</small>
               </div>
-              <p className="muted">Keep your Order ID and mobile number to track this order. It's also saved on this device.</p>
-              <button
-                className="primary full"
-                onClick={() => {
-                  setStep("closed");
-                  setOrder(null);
-                  setTimeout(() => scrollTo("track"), 50);
-                }}
-              >
-                Track this order <ArrowRight size={17} />
-              </button>
-              <button className="ghostBtn full" onClick={() => setStep("closed")}>
+              <button className="primary full" onClick={closeDrawer}>
                 Continue shopping
               </button>
             </div>
@@ -598,151 +769,5 @@ function Bill({ subtotal, payLabel = "Total" }: { subtotal: number; payLabel?: s
         <b>{money(subtotal)}</b>
       </p>
     </div>
-  );
-}
-
-function TrackOrder() {
-  const [saved, setSaved] = useState<SavedOrder[]>([]);
-  const [id, setId] = useState("");
-  const [phone, setPhone] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [result, setResult] = useState<TrackedOrder | null>(null);
-
-  useEffect(() => {
-    const load = () => {
-      try {
-        setSaved(JSON.parse(localStorage.getItem(ORDERS_KEY) || "[]"));
-      } catch {}
-    };
-    load();
-    window.addEventListener("flazzo:orders", load);
-    window.addEventListener("storage", load);
-    return () => {
-      window.removeEventListener("flazzo:orders", load);
-      window.removeEventListener("storage", load);
-    };
-  }, []);
-
-  async function lookup(orderId = id, mobile = phone) {
-    setBusy(true);
-    setError("");
-    setResult(null);
-    try {
-      const res = await fetch("/api/orders/track", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: orderId, phone: mobile }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || "Could not find that order.");
-      setResult(data.order);
-    } catch (e: any) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const stepIndex = result ? TRACK_STEPS.indexOf(result.status) : -1;
-
-  return (
-    <section id="track" className="section track">
-      <div className="trackCard">
-        <div className="trackForm">
-          <p className="eyebrow">Guest orders</p>
-          <h2>Track your order</h2>
-          <p className="muted">Enter the Order ID from your confirmation and the mobile number you ordered with.</p>
-          {saved.length > 0 && (
-            <div className="recent">
-              <span>Recent on this device</span>
-              {saved.slice(0, 4).map((o) => (
-                <button
-                  key={o.id}
-                  onClick={() => {
-                    setId(o.id);
-                    setPhone(o.phone);
-                    lookup(o.id, o.phone);
-                  }}
-                >
-                  #{o.id.slice(0, 8)} · {money(o.total)} <ArrowUpRight size={13} />
-                </button>
-              ))}
-            </div>
-          )}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              lookup();
-            }}
-          >
-            <label>
-              Order ID
-              <input value={id} onChange={(e) => setId(e.target.value)} placeholder="e.g. 3f2a9c1e-…" required />
-            </label>
-            <label>
-              Mobile number
-              <input value={phone} onChange={(e) => setPhone(e.target.value)} inputMode="numeric" placeholder="10-digit mobile number" required />
-            </label>
-            <button className="primary" disabled={busy}>
-              {busy ? <span className="spinner" /> : <Search size={16} />} {busy ? "Looking up…" : "Find order"}
-            </button>
-          </form>
-          {error && (
-            <p className="formError" role="alert">
-              {error}
-            </p>
-          )}
-        </div>
-        <div className="trackResult" aria-live="polite">
-          {busy && (
-            <div className="skeleton">
-              <span />
-              <span />
-              <span />
-              <span />
-            </div>
-          )}
-          {!busy && !result && (
-            <div className="trackEmpty">
-              <Truck size={34} />
-              <p>Your order status shows up here, from New to Delivered.</p>
-            </div>
-          )}
-          {!busy && result && (
-            <div className="trackOut">
-              <div className="trackHead">
-                <span>#{result.id.slice(0, 8)}</span>
-                <b className={`pill s-${result.status.replace(/\s+/g, "-").toLowerCase()}`}>{result.status}</b>
-              </div>
-              {result.status === "Cancelled" ? (
-                <p className="muted">This order was cancelled. Please place a new order if you still need atta.</p>
-              ) : (
-                <ol className="progress">
-                  {TRACK_STEPS.map((s, i) => (
-                    <li key={s} className={i <= stepIndex ? "on" : ""}>
-                      <i />
-                      {s}
-                    </li>
-                  ))}
-                </ol>
-              )}
-              <ul className="trackItems">
-                {result.items.map((it, i) => (
-                  <li key={i}>
-                    {it.productName} · {it.kg} KG × {it.quantity} <span>{it.grinding}</span>
-                  </li>
-                ))}
-              </ul>
-              <p className="trackTotal">
-                <span>{result.paymentMethod}</span>
-                <b>{money(result.total)}</b>
-              </p>
-              <small className="muted">Placed {new Date(result.createdAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</small>
-            </div>
-          )}
-        </div>
-      </div>
-    </section>
   );
 }
